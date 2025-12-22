@@ -85,6 +85,7 @@ class GenerationPipeline:
     ) -> Image.Image:
         """
         Edit image with retry logic to ensure quality.
+        Enhanced with improved quality scoring and reference image comparison.
         
         Args:
             image: Input image to edit
@@ -97,12 +98,19 @@ class GenerationPipeline:
         """
         best_image = None
         best_quality_score = 0.0
+        best_quality_metrics = None
         last_exception = None
+        
+        # Improved seed variation strategy: use different prime numbers for better variation
+        # Each attempt uses a different increment to maximize diversity
+        seed_increments = [17, 31, 47, 61, 79]  # Prime numbers for better variation
         
         for attempt in range(max_retries):
             try:
-                # Use slightly different seed for each retry to get variation
-                retry_seed = base_seed + attempt * 17  # Use prime number for better variation
+                # Use improved seed variation strategy
+                # Each attempt uses a different prime increment for maximum variation
+                seed_increment = seed_increments[attempt % len(seed_increments)]
+                retry_seed = base_seed + seed_increment * (attempt + 1)
                 set_random_seed(retry_seed)
                 
                 logger.info(f"Editing image (attempt {attempt + 1}/{max_retries}, seed: {retry_seed})")
@@ -110,45 +118,132 @@ class GenerationPipeline:
                 # Edit the image
                 image_edited = self.qwen_edit.edit_image(prompt_image=image, seed=retry_seed)
                 
-                # Validate quality
+                # Validate quality with reference image comparison
                 is_valid, quality_metrics = validate_image_quality(image_edited, reference_image=image)
                 
-                # Calculate quality score (higher is better)
-                # Combine multiple metrics into a single score
-                variance_score = 1.0 - min(quality_metrics.get("variance", 0) / 10000, 1.0)
-                extreme_pixel_score = 1.0 - min(quality_metrics.get("extreme_pixel_ratio", 0) * 10, 1.0)
-                local_var_score = min(quality_metrics.get("avg_local_variance", 0) / 100, 1.0)
+                # Enhanced quality score calculation (higher is better)
+                # Uses adaptive thresholds and includes reference comparison
                 
-                quality_score = (variance_score * 0.4 + extreme_pixel_score * 0.3 + local_var_score * 0.3)
+                # 1. Variance score (adaptive threshold)
+                adaptive_variance_threshold = quality_metrics.get("adaptive_variance_threshold", 10000)
+                variance = quality_metrics.get("variance", 0)
+                variance_score = 1.0 - min(variance / max(adaptive_variance_threshold, 1), 1.0)
+                
+                # 2. Extreme pixel score
+                extreme_ratio = quality_metrics.get("extreme_pixel_ratio", 0)
+                extreme_pixel_score = 1.0 - min(extreme_ratio * 10, 1.0)
+                
+                # 3. Local variance score (adaptive threshold)
+                adaptive_local_var_threshold = quality_metrics.get("adaptive_local_var_threshold", 10)
+                avg_local_var = quality_metrics.get("avg_local_variance", 0)
+                local_var_score = min(avg_local_var / max(adaptive_local_var_threshold, 1), 1.0)
+                
+                # 4. Laplacian variance score (sharpness indicator)
+                laplacian_var = quality_metrics.get("laplacian_variance", 0)
+                # Normalize based on typical good values (50-500 range)
+                laplacian_score = min(laplacian_var / 500.0, 1.0) if laplacian_var > 0 else 0.0
+                
+                # 5. Edge sharpness score
+                edge_sharpness = quality_metrics.get("edge_sharpness", 0)
+                edge_score = min(edge_sharpness / 20.0, 1.0)  # Normalize to 0-1
+                
+                # 6. Reference image comparison scores (if available)
+                ssim_score = quality_metrics.get("ssim_score")
+                color_similarity = quality_metrics.get("color_similarity")
+                
+                # Calculate composite quality score with adaptive weights
+                # Base scores (always used) - weights sum to 1.0
+                base_score_components = [
+                    (variance_score, 0.25),      # Reduced from 0.4
+                    (extreme_pixel_score, 0.20), # Reduced from 0.3
+                    (local_var_score, 0.20),     # Reduced from 0.3
+                    (laplacian_score, 0.20),     # NEW: sharpness indicator (increased from 0.15)
+                    (edge_score, 0.15),          # NEW: edge quality (increased from 0.10)
+                ]
+                # Verify weights sum to 1.0
+                base_weight_sum = sum(w for _, w in base_score_components)
+                
+                # Reference comparison scores (if available, boost their weight)
+                if ssim_score is not None and color_similarity is not None:
+                    # When reference is available, give it significant weight (30%)
+                    reference_weight = 0.3
+                    # Normalize base weights to make room for reference (70% total)
+                    normalized_base_weights = [(score, w * (1 - reference_weight) / base_weight_sum) 
+                                             for score, w in base_score_components]
+                    
+                    # Combine reference scores (SSIM weighted more than color)
+                    reference_score = (ssim_score * 0.6 + color_similarity * 0.4)
+                    
+                    quality_score = (
+                        sum(score * weight for score, weight in normalized_base_weights) +
+                        reference_score * reference_weight
+                    )
+                else:
+                    # No reference image, normalize base weights to sum to 1.0
+                    normalized_base_weights = [(score, w / base_weight_sum) 
+                                             for score, w in base_score_components]
+                    quality_score = sum(score * weight for score, weight in normalized_base_weights)
+                
+                # Penalty for validation issues
+                issues = quality_metrics.get("issues", [])
+                issue_penalty = len(issues) * 0.1
+                quality_score = max(0.0, quality_score - issue_penalty)
                 
                 logger.info(
                     f"Image quality check (attempt {attempt + 1}): "
                     f"valid={is_valid}, score={quality_score:.3f}, "
-                    f"variance={quality_metrics.get('variance', 0):.1f}, "
-                    f"issues={quality_metrics.get('issues', [])}"
+                    f"variance={variance:.1f}, laplacian={laplacian_var:.1f}, "
+                    f"edge_sharpness={edge_sharpness:.2f}, "
+                    f"ssim={ssim_score:.3f if ssim_score is not None else 'N/A'}, "
+                    f"color_sim={color_similarity:.3f if color_similarity is not None else 'N/A'}, "
+                    f"issues={issues}"
                 )
                 
                 # Track best result
                 if quality_score > best_quality_score:
                     best_quality_score = quality_score
                     best_image = image_edited
+                    best_quality_metrics = quality_metrics.copy()
                 
-                # If quality is acceptable, return immediately
+                # Early exit strategy: return if quality is good enough
+                # But also consider continuing if we're early in retries and score is close to threshold
                 if is_valid and quality_score >= quality_threshold:
-                    logger.success(f"Image editing successful on attempt {attempt + 1} with quality score {quality_score:.3f}")
-                    return image_edited
+                    # If score is significantly above threshold, return immediately
+                    if quality_score >= quality_threshold + 0.15:
+                        logger.success(
+                            f"Image editing successful on attempt {attempt + 1} "
+                            f"with quality score {quality_score:.3f} (well above threshold)"
+                        )
+                        return image_edited
+                    # If score is just above threshold and we have more retries, continue to find better
+                    elif attempt < max_retries - 1 and quality_score < quality_threshold + 0.1:
+                        logger.info(
+                            f"Quality acceptable (score={quality_score:.3f}), "
+                            f"but continuing to search for better result..."
+                        )
+                        continue
+                    else:
+                        logger.success(
+                            f"Image editing successful on attempt {attempt + 1} "
+                            f"with quality score {quality_score:.3f}"
+                        )
+                        return image_edited
                 
                 # If this is the last attempt, return best result
                 if attempt == max_retries - 1:
                     if best_image is not None:
                         logger.warning(
                             f"Using best result after {max_retries} attempts "
-                            f"(quality score: {best_quality_score:.3f})"
+                            f"(quality score: {best_quality_score:.3f}, "
+                            f"issues: {best_quality_metrics.get('issues', []) if best_quality_metrics else []})"
                         )
                         return best_image
                     else:
                         # Fallback: return the last attempt even if quality is poor
-                        logger.warning(f"Returning last attempt result despite quality issues")
+                        logger.warning(
+                            f"Returning last attempt result despite quality issues "
+                            f"(score: {quality_score:.3f}, issues: {issues})"
+                        )
                         return image_edited
                 
             except Exception as e:
