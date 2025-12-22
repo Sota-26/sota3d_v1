@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
 from torchvision import transforms
@@ -26,6 +27,12 @@ class BackgroundRemovalService:
         self.output_size = self.settings.output_image_size
         self.limit_padding = self.settings.limit_padding
         self.mask_threshold = self.settings.background_mask_threshold
+
+        # Enhanced settings for improved preprocessing
+        self.use_multi_threshold = True  # Use multiple thresholds for better mask quality
+        self.use_adaptive_padding = True  # Use adaptive padding based on object shape
+        self.min_mask_threshold = 0.7  # Lower threshold for better edge coverage
+        self.max_mask_threshold = 0.9  # Higher threshold for core mask
 
         # Set device
         self.device = f"cuda:{settings.qwen_gpu}" if torch.cuda.is_available() else "cpu"
