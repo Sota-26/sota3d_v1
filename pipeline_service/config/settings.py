@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     qwen_edit_height: int = Field(default=1024, env="QWEN_EDIT_HEIGHT")
     qwen_edit_width: int = Field(default=1024, env="QWEN_EDIT_WIDTH")
     num_inference_steps: int = Field(default=10, env="NUM_INFERENCE_STEPS", description="Increased from 8 for better quality")
-    true_cfg_scale: float = Field(default=1.0, env="TRUE_CFG_SCALE")
+    true_cfg_scale: float = Field(default=4.0, env="TRUE_CFG_SCALE")
     qwen_edit_prompt_path: Path = Field(default=config_dir.joinpath("qwen_edit_prompt.json"), env="QWEN_EDIT_PROMPT_PATH")
     qwen_edit_megapixels: float = Field(default=1.5, env="QWEN_EDIT_MEGAPIXELS", description="Megapixels for image preprocessing (higher = more detail preserved)")
 
