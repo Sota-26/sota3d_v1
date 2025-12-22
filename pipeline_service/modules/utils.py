@@ -130,9 +130,88 @@ def save_files(
     save_image(image_without_background, "png", "image_without_background", timestamp)
 
 
+def _calculate_ssim_simple(img1: np.ndarray, img2: np.ndarray) -> float:
+    """
+    Calculate a simplified SSIM-like metric between two images.
+    Uses mean, variance, and covariance to estimate structural similarity.
+    
+    Args:
+        img1: First image array (normalized 0-1)
+        img2: Second image array (normalized 0-1)
+        
+    Returns:
+        SSIM-like score between 0 and 1 (higher is better)
+    """
+    try:
+        # Ensure same size
+        if img1.shape != img2.shape:
+            # Resize img2 to match img1
+            img2_pil = Image.fromarray((img2 * 255).astype(np.uint8))
+            target_size = (img1.shape[1], img1.shape[0])  # PIL uses (width, height)
+            img2_pil = img2_pil.resize(target_size, Image.Resampling.LANCZOS)
+            img2 = np.array(img2_pil).astype(np.float32) / 255.0
+        
+        # Constants for SSIM calculation
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        # Calculate means
+        mu1 = np.mean(img1)
+        mu2 = np.mean(img2)
+        
+        # Calculate variances and covariance
+        sigma1_sq = np.var(img1)
+        sigma2_sq = np.var(img2)
+        sigma12 = np.mean((img1 - mu1) * (img2 - mu2))
+        
+        # SSIM formula
+        numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+        denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+        
+        ssim = numerator / (denominator + 1e-10)
+        return float(np.clip(ssim, 0.0, 1.0))
+    except Exception:
+        return 0.5  # Return neutral score on error
+
+
+def _calculate_color_similarity(img1: np.ndarray, img2: np.ndarray) -> float:
+    """
+    Calculate color histogram similarity between two images.
+    
+    Args:
+        img1: First image array (0-255)
+        img2: Second image array (0-255)
+        
+    Returns:
+        Color similarity score between 0 and 1 (higher is better)
+    """
+    try:
+        # Calculate histograms for each channel
+        hist1 = [np.histogram(img1[:, :, i], bins=32, range=(0, 256))[0] for i in range(3)]
+        hist2 = [np.histogram(img2[:, :, i], bins=32, range=(0, 256))[0] for i in range(3)]
+        
+        # Normalize histograms
+        hist1 = [h / (np.sum(h) + 1e-10) for h in hist1]
+        hist2 = [h / (np.sum(h) + 1e-10) for h in hist2]
+        
+        # Calculate correlation coefficient for each channel
+        similarities = []
+        for h1, h2 in zip(hist1, hist2):
+            # Use correlation coefficient
+            corr = np.corrcoef(h1, h2)[0, 1]
+            if np.isnan(corr):
+                corr = 0.0
+            similarities.append((corr + 1.0) / 2.0)  # Normalize to 0-1
+        
+        return float(np.mean(similarities))
+    except Exception:
+        return 0.5  # Return neutral score on error
+
+
 def validate_image_quality(image: Image.Image, reference_image: Optional[Image.Image] = None) -> Tuple[bool, dict]:
     """
     Validate image quality by checking for noise, artifacts, and other issues.
+    Now includes reference image comparison for better quality assessment.
     
     Args:
         image: The image to validate
@@ -155,16 +234,35 @@ def validate_image_quality(image: Image.Image, reference_image: Optional[Image.I
         # Calculate variance (high variance can indicate noise)
         variance = np.var(img_array)
         
-        # Calculate Laplacian variance (detects blur/noise)
+        # Calculate Laplacian variance (detects blur/noise) - improved calculation
         # Convert to grayscale for Laplacian
         gray = np.mean(img_array, axis=2).astype(np.float32)
         
-        # Simple Laplacian-like variance calculation
-        # Calculate variance of differences between adjacent pixels
-        if gray.size > 1:
-            h_diff = np.diff(gray, axis=0)
-            w_diff = np.diff(gray, axis=1)
-            laplacian_var = float(np.var(h_diff) + np.var(w_diff))
+        # Improved Laplacian variance calculation using proper kernel
+        if gray.size > 1 and gray.shape[0] > 2 and gray.shape[1] > 2:
+            try:
+                # Calculate second derivatives (Laplacian approximation)
+                # Only use n=2 if image is large enough
+                if gray.shape[0] > 2 and gray.shape[1] > 2:
+                    h_diff = np.diff(gray, axis=0, n=2)
+                    w_diff = np.diff(gray, axis=1, n=2)
+                    if h_diff.size > 0 and w_diff.size > 0:
+                        laplacian_var = float(np.var(h_diff) + np.var(w_diff))
+                    else:
+                        # Fallback to simple difference variance
+                        h_diff = np.diff(gray, axis=0)
+                        w_diff = np.diff(gray, axis=1)
+                        laplacian_var = float(np.var(h_diff) + np.var(w_diff))
+                else:
+                    # Fallback for small images
+                    h_diff = np.diff(gray, axis=0)
+                    w_diff = np.diff(gray, axis=1)
+                    laplacian_var = float(np.var(h_diff) + np.var(w_diff))
+            except Exception:
+                # Fallback to simple difference variance on any error
+                h_diff = np.diff(gray, axis=0)
+                w_diff = np.diff(gray, axis=1)
+                laplacian_var = float(np.var(h_diff) + np.var(w_diff))
         else:
             laplacian_var = 0.0
         
@@ -186,7 +284,39 @@ def validate_image_quality(image: Image.Image, reference_image: Optional[Image.I
         
         avg_local_var = np.mean(local_vars) if local_vars else 0
         
-        # Quality thresholds
+        # Calculate edge sharpness (using gradient magnitude)
+        if gray.size > 1:
+            grad_y = np.gradient(gray, axis=0)
+            grad_x = np.gradient(gray, axis=1)
+            gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            edge_sharpness = float(np.mean(gradient_magnitude))
+        else:
+            edge_sharpness = 0.0
+        
+        # Reference image comparison metrics
+        ssim_score = None
+        color_similarity = None
+        if reference_image is not None:
+            try:
+                ref_array = np.array(reference_image.convert("RGB"))
+                # Normalize to 0-1 for SSIM
+                img_norm = img_array.astype(np.float32) / 255.0
+                ref_norm = ref_array.astype(np.float32) / 255.0
+                # Convert to grayscale for SSIM
+                img_gray = np.mean(img_norm, axis=2)
+                ref_gray = np.mean(ref_norm, axis=2)
+                ssim_score = _calculate_ssim_simple(img_gray, ref_gray)
+                color_similarity = _calculate_color_similarity(img_array, ref_array)
+            except Exception as e:
+                logger.debug(f"Error calculating reference comparison: {e}")
+        
+        # Adaptive thresholds based on image characteristics
+        # For high-resolution images, variance threshold should be higher
+        image_size = img_array.size
+        adaptive_variance_threshold = 10000 * (1 + image_size / (512 * 512))  # Scale with image size
+        adaptive_local_var_threshold = 10 * (1 + image_size / (1024 * 1024))  # Scale with image size
+        
+        # Quality metrics
         quality_metrics = {
             "mean_brightness": mean_brightness,
             "std_dev": std_dev,
@@ -194,14 +324,17 @@ def validate_image_quality(image: Image.Image, reference_image: Optional[Image.I
             "laplacian_variance": float(laplacian_var),
             "extreme_pixel_ratio": extreme_ratio,
             "avg_local_variance": float(avg_local_var),
+            "edge_sharpness": edge_sharpness,
+            "ssim_score": ssim_score,
+            "color_similarity": color_similarity,
         }
         
-        # Validation criteria
+        # Validation criteria with adaptive thresholds
         is_valid = True
         issues = []
         
-        # Check for excessive noise (very high variance relative to mean)
-        if variance > 10000:  # Threshold for excessive noise
+        # Check for excessive noise (adaptive threshold)
+        if variance > adaptive_variance_threshold:
             is_valid = False
             issues.append("excessive_variance")
         
@@ -210,8 +343,8 @@ def validate_image_quality(image: Image.Image, reference_image: Optional[Image.I
             is_valid = False
             issues.append("excessive_extreme_pixels")
         
-        # Check for too uniform (potential corruption)
-        if avg_local_var < 10:  # Very low local variance
+        # Check for too uniform (adaptive threshold)
+        if avg_local_var < adaptive_local_var_threshold:
             is_valid = False
             issues.append("too_uniform")
         
@@ -220,8 +353,21 @@ def validate_image_quality(image: Image.Image, reference_image: Optional[Image.I
             is_valid = False
             issues.append("extreme_brightness")
         
+        # Check for blur (low Laplacian variance relative to image size)
+        laplacian_threshold = 50 * (image_size / (512 * 512))
+        if laplacian_var < laplacian_threshold and image_size > 256 * 256:
+            is_valid = False
+            issues.append("too_blurry")
+        
+        # Check edge sharpness
+        if edge_sharpness < 5.0 and image_size > 256 * 256:
+            is_valid = False
+            issues.append("low_edge_sharpness")
+        
         quality_metrics["is_valid"] = is_valid
         quality_metrics["issues"] = issues
+        quality_metrics["adaptive_variance_threshold"] = adaptive_variance_threshold
+        quality_metrics["adaptive_local_var_threshold"] = adaptive_local_var_threshold
         
         return is_valid, quality_metrics
         
